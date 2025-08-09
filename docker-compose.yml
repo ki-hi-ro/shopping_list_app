@@ -1,0 +1,43 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: shopping
+      POSTGRES_USER: shopping
+      POSTGRES_PASSWORD: shopping
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  backend:
+    build: ./backend
+    command: bash -c "python wait_for_db.py && python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    environment:
+      DJANGO_DEBUG: "1"
+      DB_NAME: shopping
+      DB_USER: shopping
+      DB_PASSWORD: shopping
+      DB_HOST: db
+      DB_PORT: 5432
+      ALLOWED_HOSTS: "*"
+      CORS_ALLOW_ALL_ORIGINS: "1"
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    restart: on-failure
+  frontend:
+    build: ./frontend
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+volumes:
+  dbdata:
