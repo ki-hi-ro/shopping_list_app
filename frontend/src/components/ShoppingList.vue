@@ -37,6 +37,7 @@
         </template>
       </draggable>
     </section>
+    <div v-if="offline" style="margin:8px 0; font-size:12px; opacity:.7;">オフラインモード（変更は後で同期）</div>
   </div>
 </template>
 
@@ -44,76 +45,168 @@
 import { onMounted, reactive, ref } from 'vue'
 import axios from 'axios'
 import draggable from 'vuedraggable'
+import { loadLocal, saveLocal, loadQueue, pushQueue, setQueue, clearQueue } from '../storage'
 
 const sections = reactive([])
 const newSectionTitle = ref('')
 let listId = null
+const offline = ref(!navigator.onLine)
 
-async function ensureList() {
+window.addEventListener('online', () => { offline.value = false; flushQueue() })
+window.addEventListener('offline', () => { offline.value = true })
+
+async function ensureListOnline() {
   const { data } = await axios.get('/api/lists/')
-  if (data.length) {
-    listId = data[0].id
-    return data[0]
-  }
+  if (data.length) { listId = data[0].id; return data[0] }
   const res = await axios.post('/api/lists/', { name: 'My List' })
-  listId = res.data.id
-  return res.data
+  listId = res.data.id; return res.data
 }
 
-async function fetchSections() {
+async function fetchSectionsOnline() {
   const { data } = await axios.get('/api/lists/' + listId + '/')
-  sections.splice(0, sections.length, ...data.sections.map(s => ({...s, _newName: '', _newQty: ''})))
+  // Vue用に作業フィールドを付与
+  const shaped = data.sections.map(s => ({...s, _newName: '', _newQty: ''}))
+  sections.splice(0, sections.length, ...shaped)
+  saveLocal(sections) // 最新をローカルに保存
+}
+
+function loadSectionsOffline() {
+  const shaped = loadLocal().map(s => ({...s, _newName: '', _newQty: ''}))
+  sections.splice(0, sections.length, ...shaped)
 }
 
 async function createSection() {
-  if (!newSectionTitle.value.trim()) return
-  await axios.post('/api/sections/', { list: listId, title: newSectionTitle.value, position: sections.length })
+  const title = (newSectionTitle.value || '').trim()
+  if (!title) return
+  if (!offline.value) {
+    await axios.post('/api/sections/', { list: listId, title, position: sections.length })
+    await fetchSectionsOnline()
+  } else {
+    // ローカル追加
+    const tmpId = 'tmp-sec-' + Date.now()
+    sections.push({ id: tmpId, list: listId, title, position: sections.length, items: [], _newName:'', _newQty:'' })
+    saveLocal(sections)
+    pushQueue({ type: 'createSection', payload: { title } })
+  }
   newSectionTitle.value = ''
-  await fetchSections()
 }
 
 async function updateSection(section) {
-  await axios.patch('/api/sections/' + section.id + '/', { title: section.title })
+  if (!offline.value && !(''+section.id).startsWith('tmp-sec-')) {
+    await axios.patch('/api/sections/' + section.id + '/', { title: section.title })
+    saveLocal(sections)
+  } else {
+    saveLocal(sections)
+    pushQueue({ type: 'updateSection', payload: { id: section.id, title: section.title } })
+  }
 }
 
 async function removeSection(section) {
-  await axios.delete('/api/sections/' + section.id + '/')
-  await fetchSections()
+  // 画面先行で削除
+  const idx = sections.findIndex(s => s.id === section.id); if (idx >= 0) sections.splice(idx, 1)
+  saveLocal(sections)
+  if (!offline.value && !(''+section.id).startsWith('tmp-sec-')) {
+    await axios.delete('/api/sections/' + section.id + '/')
+  } else {
+    pushQueue({ type: 'removeSection', payload: { id: section.id } })
+  }
 }
 
 async function createItem(section) {
-  const name = (section._newName || '').trim()
-  if (!name) return
-  await axios.post('/api/items/', {
-    section: section.id,
-    name,
-    qty: section._newQty || '',
-    position: section.items.length,
-  })
+  const name = (section._newName || '').trim(); if (!name) return
+  const qty = section._newQty || ''
+  if (!offline.value && !(''+section.id).startsWith('tmp-sec-')) {
+    await axios.post('/api/items/', { section: section.id, name, qty, position: section.items.length })
+    await fetchSectionsOnline()
+  } else {
+    const tmpId = 'tmp-item-' + Date.now()
+    section.items.push({ id: tmpId, section: section.id, name, qty, position: section.items.length })
+    saveLocal(sections)
+    pushQueue({ type: 'createItem', payload: { sectionId: section.id, name, qty } })
+  }
   section._newName = ''
   section._newQty = ''
-  await fetchSections()
 }
 
 async function toggleItem(item) {
-  // Soft remove (completed) then refetch; on iPhone it's instant feedback
-  await axios.post('/api/items/' + item.id + '/toggle/', { hard_delete: true })
-  await fetchSections()
-}
+  // 画面から即消す（ハード削除の挙動）
+  for (const s of sections) {
+    const i = s.items.findIndex(it => it.id === item.id)
+    if (i >= 0) { s.items.splice(i, 1); break }
+  }
+  saveLocal(sections)
 
-async function hardDelete(item) {
-  await axios.delete('/api/items/' + item.id + '/')
-  await fetchSections()
+  if (!offline.value && !(''+item.id).startsWith('tmp-item-')) {
+    await axios.post('/api/items/' + item.id + '/toggle/', { hard_delete: true })
+  } else {
+    pushQueue({ type: 'toggleItem', payload: { id: item.id, hard_delete: true } })
+  }
 }
 
 async function onReorder(section) {
   const ids = section.items.map(i => i.id)
-  await axios.post(`/api/sections/${section.id}/reorder/`, { item_ids: ids })
+  saveLocal(sections)
+  if (!offline.value && !(''+section.id).startsWith('tmp-sec-') && !ids.some(id => (''+id).startsWith('tmp-item-'))) {
+    await axios.post(`/api/sections/${section.id}/reorder/`, { item_ids: ids })
+  } else {
+    pushQueue({ type: 'reorder', payload: { sectionId: section.id, ids } })
+  }
+}
+
+// オンライン復帰時：キューを順に実行
+async function flushQueue() {
+  let q = loadQueue()
+  if (!q.length) return
+  for (const job of q) {
+    try {
+      if (job.type === 'createSection') {
+        await axios.post('/api/sections/', { list: listId, title: job.payload.title })
+      } else if (job.type === 'updateSection') {
+        // tmp-id の可能性：最新状態取得後に反映されるのでスキップしてもOK
+        const { id, title } = job.payload
+        if (!(''+id).startsWith('tmp-sec-')) await axios.patch('/api/sections/'+id+'/', { title })
+      } else if (job.type === 'removeSection') {
+        const { id } = job.payload
+        if (!(''+id).startsWith('tmp-sec-')) await axios.delete('/api/sections/'+id+'/')
+      } else if (job.type === 'createItem') {
+        const { sectionId, name, qty } = job.payload
+        // tmp section の時は最新pull後に作成し直されるので一旦後回しにできる
+        if (!(''+sectionId).startsWith('tmp-sec-')) {
+          await axios.post('/api/items/', { section: sectionId, name, qty, position: 9999 })
+        }
+      } else if (job.type === 'toggleItem') {
+        const { id } = job.payload
+        if (!(''+id).startsWith('tmp-item-')) await axios.post('/api/items/'+id+'/toggle/', { hard_delete: true })
+      } else if (job.type === 'reorder') {
+        const { sectionId, ids } = job.payload
+        if (!(''+sectionId).startsWith('tmp-sec-') && !ids.some(i => (''+i).startsWith('tmp-item-'))) {
+          await axios.post(`/api/sections/${sectionId}/reorder/`, { item_ids: ids })
+        }
+      }
+      // 成功したjobは削除
+      q = loadQueue().filter(j => j.id !== job.id); setQueue(q)
+    } catch (e) {
+      // 失敗したら残して終了（次回オンラインで再試行）
+      break
+    }
+  }
+  await fetchSectionsOnline()
 }
 
 onMounted(async () => {
-  await ensureList()
-  await fetchSections()
+  try {
+    if (!offline.value) {
+      await ensureListOnline()
+      await fetchSectionsOnline()
+      await flushQueue()
+    } else {
+      loadSectionsOffline()
+    }
+  } catch (e) {
+    // APIに繋がらない場合はオフライン扱いでローカル読込
+    offline.value = true
+    loadSectionsOffline()
+  }
 })
 </script>
 

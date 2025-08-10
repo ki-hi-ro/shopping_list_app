@@ -12,7 +12,7 @@ services:
 
   backend:
     build: ./backend
-    command: bash -c "python wait_for_db.py && python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    command: bash -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
     environment:
       DJANGO_DEBUG: "1"
       DB_NAME: shopping
@@ -34,7 +34,6 @@ services:
     command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
     volumes:
       - ./frontend:/app
-      - /app/node_modules
     ports:
       - "5173:5173"
     depends_on:
