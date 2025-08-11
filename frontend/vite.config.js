@@ -2,6 +2,9 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { VitePWA } from 'vite-plugin-pwa'   // ←これが必要！
 
+// 例：ホストのLAN IPを env から渡す（開発時のみ）
+const host = process.env.VITE_DEV_HOST || 'localhost'
+
 export default defineConfig({
   plugins: [
     vue(),
